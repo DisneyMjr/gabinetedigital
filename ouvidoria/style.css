@@ -1,0 +1,52 @@
+:root {
+    --primary-color: #4F46E5; /* Indigo moderno */
+    --bg-light: #F3F4F6;
+    --text-dark: #1F2937;
+}
+
+body {
+    background-color: var(--bg-light);
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+}
+
+/* Card Flutuante */
+.saas-card {
+    background: white;
+    border-radius: 12px;
+    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+    border: none;
+    transition: transform 0.2s;
+}
+
+/* Área de Texto da Ouvidoria */
+.listening-area {
+    background-color: #f9fafb;
+    border: 2px dashed #d1d5db;
+    border-radius: 8px;
+    resize: none;
+    transition: border-color 0.3s;
+}
+
+.listening-area:focus {
+    border-color: var(--primary-color);
+    box-shadow: none;
+    background-color: white;
+}
+
+/* Badges e Status */
+.badge-ai {
+    background-color: #EEF2FF;
+    color: #4F46E5;
+    border: 1px solid #C7D2FE;
+}
+
+/* Botão Toggle (Original/IA) */
+.toggle-view-btn {
+    font-size: 0.85rem;
+    cursor: pointer;
+    text-decoration: none;
+    color: #6B7280;
+}
+.toggle-view-btn:hover {
+    color: var(--primary-color);
+}

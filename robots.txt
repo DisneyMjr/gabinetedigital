@@ -1,0 +1,8 @@
+User-agent: *
+Allow: /
+Disallow: /admin_painel.php
+Disallow: /master_painel.php
+Disallow: /config.php
+Disallow: /protecao.php
+
+Sitemap: https://meugabinetedigital.com.br/sitemap.xml

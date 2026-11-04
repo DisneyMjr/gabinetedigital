@@ -1,0 +1,613 @@
+<?php
+// 1. Configurações de Erro (Ative para depurar, desative em produção)
+ini_set('display_errors', 1);
+ini_set('display_startup_errors', 1);
+error_reporting(E_ALL);
+
+require_once 'tracker.php'; 
+
+// 2. Importação de dependências
+if (file_exists('config.php')) {
+    require_once 'config.php';
+} else {
+    die("Erro: Arquivo config.php não encontrado.");
+}
+
+// IMPORTANTE: Aqui carregamos os arquivos de pagamento para evitar o Erro 500
+if (file_exists('gateway.php')) require_once 'gateway.php';
+// Se você usa um arquivo gateway.php que gerencia Vindi/Efí, inclua-o aqui:
+// if (file_exists('gateway.php')) require_once 'gateway.php';
+
+// --- BUSCA BANNERS HERO ---
+$hero_banners = [];
+try {
+    $stmt = $pdo->query("SELECT caminho_imagem, titulo, frase_apoio FROM login_banners WHERE tipo = 'hero' AND ativo = 1 ORDER BY id DESC");
+    $hero_banners = $stmt->fetchAll(PDO::FETCH_ASSOC);
+} catch (Exception $e) { $hero_banners = []; }
+$usar_carrossel = (count($hero_banners) > 0);
+
+// --- PROCESSAMENTO DO CADASTRO ---
+$msg_cadastro = "";
+$erro_cadastro = ""; 
+$link_direto = "";
+$is_pago = false;
+$preco_plano = 0;
+$pix_data = null;
+$txid = "";
+
+if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['acao'])) {
+    if (!isset($pdo)) die("Erro de conexão com o banco de dados.");
+    
+    $nome = trim($_POST['nome']);
+    $email = trim($_POST['email']);
+    $whatsapp = trim($_POST['whatsapp']);
+    $senha = trim($_POST['senha']);
+    $slug_base = strtolower(preg_replace('/[^a-z0-9]/', '', $_POST['slug']));
+    $tipo_cadastro = $_POST['acao']; 
+    $slug_plano = $_POST['plano_escolhido'] ?? 'teste-gratis';
+
+    try {
+        $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+
+        if (strlen($slug_base) < 3) throw new Exception("O endereço do site deve ter pelo menos 3 letras.");
+        
+        // Verifica se slug já existe
+        $stmt_check = $pdo->prepare("SELECT count(*) FROM tenants WHERE slug = ?");
+        $stmt_check->execute([$slug_base]);
+        if($stmt_check->fetchColumn() > 0) throw new Exception("Este endereço de site já está em uso.");
+        
+        // Verifica se e-mail já existe
+        $stmt_email = $pdo->prepare("SELECT count(*) FROM usuarios WHERE email = ?");
+        $stmt_email->execute([$email]);
+        if($stmt_email->fetchColumn() > 0) throw new Exception("Este e-mail já está cadastrado.");
+
+        $pdo->beginTransaction();
+        
+        if ($tipo_cadastro == 'criar_teste') {
+            $status = 'ativo'; 
+            $ativo = 1; 
+            $vencimento = date('Y-m-d H:i:s', strtotime('+7 days'));
+        } else {
+            $status = 'pendente_pagamento'; 
+            $ativo = 0; 
+            $vencimento = date('Y-m-d H:i:s', strtotime('+30 days'));
+            $is_pago = true;
+
+            $stmt_plano = $pdo->prepare("SELECT preco FROM planos WHERE slug = ?");
+            $stmt_plano->execute([$slug_plano]);
+            $preco_plano = (float) $stmt_plano->fetchColumn();
+        }
+
+        // 1. Cria o Tenant
+        $stmt = $pdo->prepare("INSERT INTO tenants (nome, slug, email_contato, plano, ativo, data_vencimento, status) VALUES (?, ?, ?, ?, ?, ?, ?)");
+        $stmt->execute([$nome, $slug_base, $email, $slug_plano, $ativo, $vencimento, $status]);
+        $tenant_id = $pdo->lastInsertId();
+
+        // 2. Configurações Iniciais
+        $pdo->prepare("INSERT INTO configuracoes (tenant_id, nome_vereador, whatsapp_oficial, cor_primaria) VALUES (?, ?, ?, '#6366f1')")
+            ->execute([$tenant_id, $nome, $whatsapp]);
+        
+        // 3. Usuário Admin
+        $senha_hash = password_hash($senha, PASSWORD_DEFAULT);
+        $permissoes = json_encode(['noticias', 'agenda', 'ouvidoria', 'transparencia', 'config', 'eleitores', 'landing', 'relatorios', 'enquetes', 'equipe', 'auditoria']);
+        $pdo->prepare("INSERT INTO usuarios (tenant_id, nome, email, senha, permissoes) VALUES (?, 'Admin', ?, ?, ?)")
+            ->execute([$tenant_id, $email, $senha_hash, $permissoes]);
+
+        // GERAÇÃO DO PIX (Ajustado para Vindi)
+        if ($is_pago && $preco_plano > 0) {
+            $descricao_venda = "Assinatura " . ucfirst($slug_plano) . " - " . $nome;
+            
+            // Verifique se a função existe para evitar Erro 500
+            if (function_exists('gerarCobrancaSaaS')) {
+                $pix_data = gerarCobrancaSaaS($nome, $email, $preco_plano, $descricao_venda, $slug_base);
+            } else {
+                // Se não houver roteador, chamamos a Vindi diretamente como fallback
+                // Supondo que você tenha a função chamarAPI_Vindi pronta
+                throw new Exception("Erro interno: Gateway de pagamento não configurado.");
+            }
+            
+            if (isset($pix_data['erro'])) {
+                throw new Exception("Erro no Pix: " . $pix_data['erro']);
+            }
+
+            $txid = $pix_data['fatura_id'] ?? '';
+            $pdo->prepare("UPDATE tenants SET txid_pagamento = ? WHERE id = ?")->execute([$txid, $tenant_id]);
+        }
+
+        $pdo->commit();
+        
+        // Definição de links (Ajustado para evitar loops de subdomínio em alguns servidores)
+        $protocolo = (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on') ? "https://" : "http://";
+        $dominio = str_replace('www.', '', $_SERVER['HTTP_HOST']);
+       // Isso evita que o navegador tente entrar no subdomínio antes da hora
+        $link_painel = $protocolo . $dominio . "/login.php?cliente=" . $slug_base;
+        $link_direto = $link_painel;
+        
+        $msg_cadastro = "sucesso";
+        
+    } catch (Exception $e) { 
+        if (isset($pdo) && $pdo->inTransaction()) $pdo->rollBack(); 
+        $erro_cadastro = $e->getMessage(); 
+    }
+}
+
+// BUSCA PLANOS PARA A TABELA
+try {
+    $stmt_planos = $pdo->query("SELECT * FROM planos WHERE ativo = 1 ORDER BY preco ASC");
+    $planos_db = $stmt_planos->fetchAll(PDO::FETCH_ASSOC);
+} catch (Exception $e) { $planos_db = []; }
+?>
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gabinete Digital | Gestão Política</title>
+    
+    <meta property="og:type" content="website">
+    <meta property="og:url" content="<?= BASE_URL ?? '' ?>">
+    <meta property="og:title" content="Revolucione seu Mandato com o Gabinete Digital">
+    <meta property="og:description" content="Acesse nosso canal direto de solicitações.">
+    <meta property="og:image" content="<?= BASE_URL ?? '' ?>assets/img/share_v2.jpg">
+    <meta property="og:image:type" content="image/jpeg">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="fb:app_id" content="922830620308085">
+    
+    <link rel="icon" href="assets/img/favicon.svg" type="image/png">
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;500;700;800&family=Plus+Jakarta+Sans:wght@400;600;700&display=swap" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link href="https://unpkg.com/aos@2.3.1/dist/aos.css" rel="stylesheet">
+
+    <style>
+        :root {
+            --primary: #6366f1; --primary-dark: #4f46e5; --accent: #ec4899;
+            --dark-bg: #0f172a; --text-main: #1e293b; --text-muted: #64748b;
+            --gradient-text: linear-gradient(to right, #6366f1, #ec4899);
+        }
+        body { font-family: 'Plus Jakarta Sans', sans-serif; background-color: #f8fafc; color: var(--text-main); overflow-x: hidden; }
+        h1, h2, h3, h4, h5, .navbar-brand { font-family: 'Outfit', sans-serif; }
+
+        .navbar { background: rgba(255, 255, 255, 0.95); backdrop-filter: blur(12px); padding: 1rem 0; box-shadow: 0 4px 20px rgba(0,0,0,0.03); }
+        .navbar-brand { font-weight: 800; font-size: 1.5rem; background: var(--gradient-text); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        .nav-link { font-weight: 600; color: var(--text-main) !important; margin: 0 10px; }
+
+        /* Hero */
+        .hero-default { background: var(--dark-bg); color: white; padding: 180px 0 120px; position: relative; overflow: hidden; min-height: 100vh; display: flex; align-items: center; }
+        .hero-default h1 { font-size: 4rem; font-weight: 800; line-height: 1.1; margin-bottom: 1.5rem; }
+        .text-gradient { background: var(--gradient-text); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        
+        .hero-carousel { height: 100vh; width: 100%; position: relative; background: var(--dark-bg); }
+        .hero-carousel .carousel-item { height: 100vh; background-size: cover; background-position: center; background-repeat: no-repeat; }
+        .video-bg { position: absolute; top: 50%; left: 50%; min-width: 100%; min-height: 100%; width: auto; height: auto; z-index: 0; transform: translate(-50%, -50%); object-fit: cover; }
+        .hero-overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: linear-gradient(to bottom, rgba(0,0,0,0.2), rgba(0,0,0,0.6)); z-index: 1; }
+        .carousel-caption { z-index: 2; bottom: 20%; text-shadow: 0 2px 15px rgba(0,0,0,0.8); }
+
+        .btn-gradient { background: linear-gradient(90deg, var(--primary), var(--accent)); color: white; border: none; padding: 15px 40px; border-radius: 50px; font-weight: 700; transition: 0.3s; box-shadow: 0 10px 30px rgba(99, 102, 241, 0.4); }
+        .btn-gradient:hover { transform: translateY(-3px) scale(1.02); color: white; box-shadow: 0 15px 40px rgba(236, 72, 153, 0.5); }
+
+        /* Feature Cards */
+        .feature-card { background: white; border-radius: 24px; padding: 30px; border: 1px solid rgba(0,0,0,0.03); box-shadow: 0 10px 30px rgba(0,0,0,0.03); height: 100%; display: flex; flex-direction: column; transition: 0.3s; }
+        .feature-card:hover { transform: translateY(-5px); border-color: var(--primary); }
+        .feature-icon { width: 60px; height: 60px; border-radius: 15px; display: flex; align-items: center; justify-content: center; font-size: 24px; margin-bottom: 20px; background: #e0e7ff; color: var(--primary); }
+        .carousel-control-prev-icon, .carousel-control-next-icon { background-color: var(--primary); border-radius: 50%; padding: 20px; }
+
+        /* --- PLANOS --- */
+        .pricing-section { background-color: #f8fafc; overflow: hidden; }
+        
+        .planos-wrapper { display: flex; flex-wrap: nowrap; justify-content: center; gap: 20px; overflow-x: auto; padding: 20px 5px 40px 5px; scrollbar-width: thin; -webkit-overflow-scrolling: touch; }
+        .planos-wrapper::-webkit-scrollbar { height: 6px; }
+        .planos-wrapper::-webkit-scrollbar-track { background: transparent; }
+        .planos-wrapper::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 10px; }
+
+        .col-plano { flex: 1 1 0; min-width: 260px; max-width: 320px; }
+        
+        .pricing-card { background: #fff; border-radius: 20px; padding: 35px 20px 25px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); transition: all 0.3s ease; border: 1px solid #f1f5f9; height: 100%; display: flex; flex-direction: column; position: relative; }
+        .pricing-card:hover { transform: translateY(-5px); border-color: var(--primary); box-shadow: 0 20px 40px rgba(99, 102, 241, 0.1); }
+        .pricing-card.popular { border: 2px solid #10b981; }
+        .pricing-card.premium { border: 2px solid #6366f1; background: linear-gradient(to bottom, #fff, #f5f7ff); }
+
+        .pricing-header h3 { font-size: 1.1rem; font-weight: 800; color: var(--text-main); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 15px; }
+        
+        .pricing-price { display: flex; align-items: baseline; justify-content: center; margin-bottom: 20px; color: var(--text-main); min-height: 50px; }
+        .pricing-price .currency { font-size: 1rem; font-weight: 600; margin-right: 3px; align-self: center; }
+        .pricing-price .amount { font-size: 2.5rem; font-weight: 800; letter-spacing: -1px; line-height: 1; align-self: center;}
+        .pricing-price .period { color: var(--text-muted); font-size: 0.8rem; margin-left: 3px; font-weight: 500; align-self: center;}
+        .pricing-price .text-custom { font-size: 2rem; font-weight: 800; line-height: 1; align-self: center; text-align: center; width: 100%;}
+
+        .pricing-features-container { flex-grow: 1; margin-bottom: 25px; position: relative; }
+        .pricing-features { max-height: 220px; overflow: hidden; transition: max-height 0.5s ease-in-out; }
+        .pricing-features.collapsed::after { content: ""; position: absolute; bottom: 0; left: 0; width: 100%; height: 50px; background: linear-gradient(to bottom, rgba(255,255,255,0), rgba(255,255,255,1)); pointer-events: none; }
+        .pricing-features.expanded { max-height: 1200px; }
+        .pricing-features.expanded::after { display: none; }
+
+        .pricing-features ul { list-style: none; padding: 0; margin: 0; }
+        .pricing-features li { display: flex; align-items: flex-start; margin-bottom: 10px; color: var(--text-muted); font-size: 0.85rem; line-height: 1.3; text-align: left; }
+        .pricing-features li i { color: #10b981; margin-right: 8px; flex-shrink: 0; font-size: 0.9rem; margin-top: 3px;}
+
+        .btn-expand { background: none; border: none; color: var(--primary); font-size: 0.8rem; font-weight: 700; cursor: pointer; padding: 0; margin-top: 8px; display: flex; align-items: center; justify-content: center; width: 100%; text-transform: uppercase; }
+        .btn-expand:hover { text-decoration: underline; }
+        .btn-expand i { margin-left: 5px; transition: transform 0.3s; }
+        .pricing-features.expanded + .btn-expand i { transform: rotate(180deg); }
+
+        .pricing-action { margin-top: auto; }
+        .btn-pricing { width: 100%; padding: 12px; border-radius: 50px; font-weight: 700; transition: 0.3s; font-size: 0.9rem; }
+        
+        .btn-outline-custom { border: 2px solid #e2e8f0; color: var(--text-main); background: transparent; }
+        .btn-outline-custom:hover { border-color: var(--text-main); background: var(--text-main); color: white; }
+        .btn-popular { background: #10b981; color: white; border: none; box-shadow: 0 4px 15px rgba(16, 185, 129, 0.3); }
+        .btn-popular:hover { background: #059669; transform: translateY(-2px); color: white; }
+        .btn-premium { background: var(--primary); color: white; border: none; box-shadow: 0 4px 15px rgba(99, 102, 241, 0.3); }
+        .btn-premium:hover { background: var(--primary-dark); transform: translateY(-2px); color: white; }
+
+        .badge-popular { position: absolute; top: -14px; left: 50%; transform: translateX(-50%); z-index: 10; background: #10b981; color: white; padding: 6px 15px; border-radius: 20px; font-size: 0.75rem; font-weight: 800; text-transform: uppercase; letter-spacing: 1px; box-shadow: 0 4px 10px rgba(16, 185, 129, 0.3); white-space: nowrap; }
+        .badge-premium { position: absolute; top: -14px; left: 50%; transform: translateX(-50%); z-index: 10; background: linear-gradient(90deg, #6366f1, #ec4899); color: white; padding: 6px 15px; border-radius: 20px; font-size: 0.75rem; font-weight: 800; text-transform: uppercase; letter-spacing: 1px; box-shadow: 0 4px 10px rgba(99, 102, 241, 0.3); white-space: nowrap; }
+        .badge-custom { position: absolute; top: -14px; left: 50%; transform: translateX(-50%); z-index: 10; background: linear-gradient(90deg, #3b82f6, #8b5cf6); color: white; padding: 6px 15px; border-radius: 20px; font-size: 0.75rem; font-weight: 800; text-transform: uppercase; letter-spacing: 1px; box-shadow: 0 4px 10px rgba(59, 130, 246, 0.3); white-space: nowrap; }
+
+        .contrato-box { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px; padding: 25px; height: 320px; overflow-y: auto; font-size: 0.9rem; text-align: justify; }
+        
+        /* Custom Scrollbar for contract box */
+        .contrato-box::-webkit-scrollbar { width: 8px; }
+        .contrato-box::-webkit-scrollbar-thumb { background-color: #cbd5e1; border-radius: 10px; }
+
+        footer { background: var(--dark-bg); color: white; padding: 80px 0 30px; }
+
+        @media (max-width: 991px) {
+            .hero-default h1 { font-size: 2.8rem; }
+            .planos-wrapper { justify-content: flex-start; }
+        }
+    </style>
+</head>
+<body>
+
+    <?php if(!empty($erro_cadastro)): ?>
+    <div class="alert alert-danger alert-dismissible fade show fixed-top m-3 shadow-lg" role="alert" style="z-index: 99999;">
+        <h5 class="alert-heading fw-bold"><i class="fas fa-exclamation-triangle"></i> Atenção! Não foi possível concluir o cadastro.</h5>
+        <p class="mb-0"><?= htmlspecialchars($erro_cadastro) ?></p>
+        <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+    </div>
+    <script>
+        // Reabre o modal automaticamente se deu erro para a pessoa tentar de novo
+        document.addEventListener("DOMContentLoaded", function() {
+            var modal = new bootstrap.Modal(document.getElementById('modalCadastro'));
+            document.getElementById('step-contract').style.display = 'none';
+            document.getElementById('step-form').style.display = 'block';
+            modal.show();
+        });
+    </script>
+    <?php endif; ?>
+
+    <nav class="navbar navbar-expand-lg fixed-top">
+        <div class="container">
+            <a class="navbar-brand" href="#"><i class="fas fa-layer-group me-2"></i>Gabinete<span class="fw-light">Digital</span></a>
+            <button class="navbar-toggler border-0" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav"><i class="fas fa-bars"></i></button>
+            <div class="collapse navbar-collapse" id="navbarNav">
+                <ul class="navbar-nav ms-auto align-items-center">
+                    <li class="nav-item"><a class="nav-link" href="#recursos">Funcionalidades</a></li>
+                    <li class="nav-item"><a class="nav-link" href="#planos">Planos</a></li>
+                    <li class="nav-item ms-lg-3"><a href="login.php" class="btn btn-outline-primary rounded-pill px-4 btn-sm fw-bold">Área do Cliente</a></li>
+                </ul>
+            </div>
+        </div>
+    </nav>
+
+    <?php if($usar_carrossel): ?>
+        <section class="hero-carousel">
+            <div id="heroSlider" class="carousel slide carousel-fade" data-bs-ride="carousel" data-bs-interval="6000">
+                <?php if(count($hero_banners) > 1): ?>
+                <div class="carousel-indicators">
+                    <?php foreach($hero_banners as $i => $b): ?>
+                        <button type="button" data-bs-target="#heroSlider" data-bs-slide-to="<?= $i ?>" class="<?= $i==0?'active':'' ?>" aria-current="true"></button>
+                    <?php endforeach; ?>
+                </div>
+                <?php endif; ?>
+                <div class="carousel-inner h-100">
+                    <?php foreach($hero_banners as $i => $b): 
+                        $ext = strtolower(pathinfo($b['caminho_imagem'], PATHINFO_EXTENSION));
+                        $is_video = in_array($ext, ['mp4', 'webm', 'ogg']);
+                    ?>
+                    <div class="carousel-item h-100 <?= $i==0 ? 'active' : '' ?>" style="<?= !$is_video ? "background-image: url('{$b['caminho_imagem']}');" : '' ?>">
+                        <?php if($is_video): ?>
+                            <video class="video-bg" autoplay muted loop playsinline><source src="<?= $b['caminho_imagem'] ?>" type="video/mp4"></video>
+                            <div class="hero-overlay"></div>
+                        <?php endif; ?>
+                        <?php if(!empty($b['titulo'])): ?>
+                        <div class="carousel-caption d-none d-md-block pb-5">
+                            <h1 class="display-3 fw-bold mb-3"><?= htmlspecialchars($b['titulo']) ?></h1>
+                            <p class="lead mb-4"><?= htmlspecialchars($b['frase_apoio']) ?></p>
+                            <button onclick="document.getElementById('planos').scrollIntoView()" class="btn btn-gradient btn-lg">Começar Agora</button>
+                        </div> 
+                        <?php endif; ?>
+                    </div>
+                    <?php endforeach; ?>
+                </div>
+                <?php if(count($hero_banners) > 1): ?>
+                <button class="carousel-control-prev" type="button" data-bs-target="#heroSlider" data-bs-slide="prev"><span class="carousel-control-prev-icon"></span></button>
+                <button class="carousel-control-next" type="button" data-bs-target="#heroSlider" data-bs-slide="next"><span class="carousel-control-next-icon"></span></button>
+                <?php endif; ?>
+            </div>
+        </section>
+        
+    <?php else: ?>
+        <section class="hero-default">
+            <div class="container hero-content position-relative z-2">
+                <div class="row align-items-center gy-5">
+                    <div class="col-lg-6" data-aos="fade-right">
+                        <div class="d-inline-block px-3 py-1 mb-4 rounded-pill border border-secondary text-white-50 small bg-white bg-opacity-10 backdrop-blur">🚀 Tecnologia Eleitoral 2.0</div>
+                        <h1>Revolucione seu <br><span class="text-gradient">Mandato Digital</span></h1>
+                        <p class="lead text-white mb-5 fw-medium" style="max-width: 500px;">A plataforma completa para políticos modernos.</p>
+                        <div class="d-flex gap-3 flex-wrap">
+                            <button onclick="document.getElementById('planos').scrollIntoView()" class="btn btn-gradient">Começar Agora</button>
+                            <a href="#recursos" class="btn btn-light rounded-pill px-4 py-3 fw-bold shadow-sm text-primary">Ver Funcionalidades</a>
+                        </div>
+                    </div>
+                    <div class="col-lg-6 text-center" data-aos="fade-left">
+                        <div class="position-relative"><img src="http://meugabinetedigital.com.br/assets/img/mao_celular.png" alt="App Demo" class="img-fluid" style="filter: drop-shadow(0 20px 50px rgba(0,0,0, 0.5)); max-width: 80%; animation: float 6s ease-in-out infinite;"></div>
+                    </div>
+                </div>
+            </div>
+        </section>
+    <?php endif; ?>
+
+    <section id="recursos" class="py-5 bg-white">
+        <div class="container py-5">
+            <div class="text-center mb-5" data-aos="fade-up"><h6 class="text-primary fw-bold text-uppercase ls-2">Poder Total</h6><h2 class="display-5 fw-bold mb-3">Tudo o que o sistema oferece</h2><p class="text-muted mx-auto" style="max-width: 600px;">Uma suíte completa de ferramentas.</p></div>
+            <div id="carouselRecursos" class="carousel slide" data-bs-ride="carousel" data-bs-interval="5000">
+                <div class="carousel-inner p-3">
+                    <div class="carousel-item active"><div class="row g-4"><div class="col-lg-4 col-md-6"><div class="feature-card"><div class="feature-icon text-primary"><i class="fas fa-users-cog"></i></div><h4>CRM de Eleitores</h4><p class="text-muted">Cadastro detalhado da base.</p></div></div><div class="col-lg-4 col-md-6"><div class="feature-card"><div class="feature-icon text-danger"><i class="fas fa-map-marked-alt"></i></div><h4>Mapa de Calor</h4><p class="text-muted">Visualize onde estão seus votos.</p></div></div><div class="col-lg-4 col-md-6"><div class="feature-card"><div class="feature-icon text-success"><i class="fas fa-bullhorn"></i></div><h4>Ouvidoria</h4><p class="text-muted">Receba demandas online.</p></div></div></div></div>
+                    <div class="carousel-item"><div class="row g-4"><div class="col-lg-4 col-md-6"><div class="feature-card"><div class="feature-icon text-info"><i class="fas fa-laptop-code"></i></div><h4>Site do Mandato</h4><p class="text-muted">Site oficial automático.</p></div></div><div class="col-lg-4 col-md-6"><div class="feature-card"><div class="feature-icon text-warning"><i class="fas fa-calendar-alt"></i></div><h4>Agenda</h4><p class="text-muted">Controle de compromissos.</p></div></div><div class="col-lg-4 col-md-6"><div class="feature-card"><div class="feature-icon text-primary"><i class="fas fa-user-tie"></i></div><h4>Lideranças</h4><p class="text-muted">Gestão de cabos eleitorais.</p></div></div></div></div>
+                    <div class="carousel-item"><div class="row g-4"><div class="col-lg-4 col-md-6"><div class="feature-card"><div class="feature-icon" style="color: #ec4899; background: #fce7f3;"><i class="fas fa-birthday-cake"></i></div><h4>Aniversariantes</h4><p class="text-muted">Aviso automático de aniversariantes.</p></div></div><div class="col-lg-4 col-md-6"><div class="feature-card"><div class="feature-icon text-info"><i class="fas fa-envelope-open-text"></i></div><h4>Disparo de E-mails</h4><p class="text-muted">Envie e-mails em massa para a base.</p></div></div><div class="col-lg-4 col-md-6"><div class="feature-card"><div class="feature-icon text-success"><i class="fas fa-hand-holding-usd"></i></div><h4>Financeiro</h4><p class="text-muted">Controle de caixa de campanha.</p></div></div></div></div>
+                </div>
+                <button class="carousel-control-prev" type="button" data-bs-target="#carouselRecursos" data-bs-slide="prev"><span class="carousel-control-prev-icon"></span></button>
+                <button class="carousel-control-next" type="button" data-bs-target="#carouselRecursos" data-bs-slide="next"><span class="carousel-control-next-icon"></span></button>
+            </div>
+        </div>
+    </section>
+
+    <section id="planos" class="pricing-section py-5">
+        <div class="container-fluid px-xl-5 py-5">
+            <div class="text-center mb-5" data-aos="fade-up">
+                <span class="badge bg-primary bg-opacity-10 text-primary px-3 py-2 rounded-pill mb-3 fw-bold">SEM FIDELIDADE</span>
+                <h2 class="display-5 fw-bold text-dark">Planos Transparentes</h2>
+                <p class="text-muted">Escolha o ideal para o seu momento.</p>
+            </div>
+
+            <div class="planos-wrapper" data-aos="fade-up">
+                
+                <?php foreach($planos_db as $plano): 
+                    $is_free = ($plano['preco'] <= 0 && empty($plano['preco_texto']));
+                    $is_popular = ($plano['preco'] > 100 && $plano['preco'] < 250); 
+                    $is_premium = ($plano['preco'] > 250); 
+                    
+                    $card_class = "";
+                    $btn_class = "btn-outline-custom";
+
+                    if($is_popular) {
+                        $card_class = "popular";
+                        $btn_class = "btn-popular";
+                    } elseif($is_premium) {
+                        $card_class = "premium";
+                        $btn_class = "btn-premium";
+                    }
+
+                    $beneficios = array_filter(explode("\n", $plano['beneficios'])); 
+                    $qtd_beneficios = count($beneficios);
+                    $limite_exibicao = 6; 
+                ?>
+                
+                <div class="col-plano d-flex align-items-stretch">
+                    <div class="pricing-card w-100 <?= $card_class ?>">
+                        
+                        <?php if(!empty($plano['badge'])): ?>
+                            <div class="badge-custom">
+                                <?= htmlspecialchars($plano['badge']) ?>
+                            </div>
+                        <?php elseif($is_popular): ?>
+                            <div class="badge-popular">MAIS POPULAR</div>
+                        <?php elseif($is_premium): ?>
+                            <div class="badge-premium">O MAIS COMPLETO</div>
+                        <?php endif; ?>
+
+                        <div class="pricing-header text-center mt-2">
+                            <h3><?= htmlspecialchars($plano['nome']) ?></h3>
+                            
+                            <div class="pricing-price">
+                                <?php if (!empty($plano['preco_texto'])): ?>
+                                    <span class="text-custom"><?= htmlspecialchars($plano['preco_texto']) ?></span>
+                                <?php elseif ($is_free): ?>
+                                    <span class="text-custom">Grátis</span>
+                                <?php else: ?>
+                                    <span class="currency">R$</span>
+                                    <span class="amount"><?= number_format($plano['preco'], 2, ',', '.') ?></span>
+                                    <span class="period">/mês</span>
+                                <?php endif; ?>
+                            </div>
+                        </div>
+
+                        <div class="pricing-features-container">
+                            <div class="pricing-features collapsed" id="features-<?= $plano['id'] ?>">
+                                <ul>
+                                    <?php foreach($beneficios as $b): ?>
+                                        <li><i class="fas fa-check-circle"></i> <?= trim($b) ?></li>
+                                    <?php endforeach; ?>
+                                </ul>
+                            </div>
+                            <?php if($qtd_beneficios > $limite_exibicao): ?>
+                                <button class="btn-expand" onclick="toggleFeatures(<?= $plano['id'] ?>, this)">
+                                    Ver todos os benefícios <i class="fas fa-chevron-down"></i>
+                                </button>
+                            <?php endif; ?>
+                        </div>
+
+                        <div class="pricing-action">
+                            <button onclick="abrirModal('<?= $is_free ? 'teste' : 'pagamento' ?>', '<?= $plano['slug'] ?>')" class="btn-pricing <?= $btn_class ?>">
+                                <?= $is_free ? 'Começar Agora' : 'Assinar Plano' ?>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+                <?php endforeach; ?>
+            </div>
+            
+            <div class="text-center mt-2 d-lg-none text-muted small">
+                <i class="fas fa-arrows-alt-h me-1"></i> Deslize para o lado para ver todos os planos
+            </div>
+        </div>
+    </section>
+
+    <footer>
+        <div class="container">
+            <div class="row g-5">
+                <div class="col-lg-4"><h4 class="fw-bold mb-4"><i class="fas fa-layer-group text-primary me-2"></i>Gabinete Digital</h4><p class="text-white-50">Tecnologia para a nova política.</p></div>
+                <div class="col-lg-2 ms-auto"><h6 class="fw-bold mb-3">Links</h6><ul class="list-unstyled text-white-50 d-flex flex-column gap-2"><li><a href="#recursos" class="text-reset text-decoration-none">Recursos</a></li><li><a href="#planos" class="text-reset text-decoration-none">Preços</a></li><li><a href="login.php" class="text-reset text-decoration-none">Login</a></li></ul></div>
+                <div class="col-lg-3"><h6 class="fw-bold mb-3">Contato</h6><ul class="list-unstyled text-white-50 d-flex flex-column gap-2"><li><i class="fab fa-whatsapp me-2"></i> 37 99912 9477</li></ul></div>
+            </div>
+            <div class="border-top border-white border-opacity-10 mt-5 pt-4 text-center text-white-50 small">&copy; <?= date('Y') ?> Gabinete Digital.</div>
+        </div>
+    </footer>
+
+    <div class="modal fade" id="modalCadastro" tabindex="-1">
+        <div class="modal-dialog modal-dialog-centered modal-lg">
+            <div class="modal-content">
+                <div class="modal-header"><h5 class="modal-title fw-bold">Criar Nova Conta</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+                <div class="modal-body p-4 p-lg-5 bg-white text-dark">
+                    
+                    <div id="step-contract">
+                        <div class="text-center mb-4">
+                            <h4 class="fw-bold">Termos e Condições</h4>
+                            <p class="text-muted">Por favor, leia atentamente antes de prosseguir.</p>
+                        </div>
+                        
+                        <div class="contrato-box mb-4 text-start bg-light border p-4 rounded">
+                            <h5 class="text-center fw-bold mb-4">CONTRATO DE LICENÇA DE USO (SaaS)</h5>
+                            
+                            <h6 class="fw-bold text-primary">1. OBJETO</h6>
+                            <p class="small text-muted mb-3">O presente instrumento tem por objeto a concessão de licença de uso temporária, não exclusiva e intransferível do software "Gabinete Digital", hospedado na nuvem (SaaS), voltado para a gestão de mandatos políticos.</p>
+                            
+                            <h6 class="fw-bold text-primary">2. DISPONIBILIDADE E ACESSO</h6>
+                            <p class="small text-muted mb-3">O sistema ficará disponível 24 horas por dia, 7 dias por semana, garantindo um SLA (Service Level Agreement) de 99% de uptime, exceto em janelas de manutenção previamente agendadas. O acesso se dará por subdomínio exclusivo do CONTRATANTE.</p>
+                            
+                            <h6 class="fw-bold text-primary">3. PLANOS E PAGAMENTOS</h6>
+                            <p class="small text-muted mb-3">A utilização do sistema está condicionada ao pagamento antecipado da mensalidade (modelo pré-pago) referente ao plano escolhido. O não pagamento acarretará na suspensão temporária do acesso após 5 dias de atraso, não isentando o CONTRATANTE dos valores devidos até a data do bloqueio.</p>
+                            
+                            <h6 class="fw-bold text-primary">4. PRIVACIDADE E LGPD</h6>
+                            <p class="small text-muted mb-3">Em conformidade com a Lei Geral de Proteção de Dados (Lei nº 13.709/2018), a CONTRATADA garante o sigilo absoluto dos dados inseridos na plataforma. O CONTRATANTE é o único controlador dos dados de seus eleitores, sendo a CONTRATADA apenas operadora tecnológica. Realizamos backups diários para garantir a integridade das informações.</p>
+
+                            <h6 class="fw-bold text-primary">5. SUPORTE TÉCNICO</h6>
+                            <p class="small text-muted mb-3">O suporte técnico será prestado via WhatsApp e E-mail, em horário comercial (segunda a sexta, das 09h às 18h), cobrindo dúvidas de utilização e correções de eventuais falhas, não englobando visitas presenciais.</p>
+
+                            <h6 class="fw-bold text-primary">6. CANCELAMENTO E FIDELIDADE</h6>
+                            <p class="small text-muted mb-0">Não exigimos tempo mínimo de permanência (sem fidelidade). O CONTRATANTE poderá solicitar o cancelamento a qualquer momento e exportar todos os seus dados livremente em formato de planilha.</p>
+                        </div>
+                        
+                        <div class="form-check p-3 border rounded bg-light mb-4">
+                            <input class="form-check-input" type="checkbox" id="checkTermos" onchange="liberarBotao()">
+                            <label class="form-check-label fw-bold ms-2" for="checkTermos">Li e concordo com os termos de uso.</label>
+                        </div>
+                        <button id="btnAceitar" class="btn btn-dark w-100 py-3 rounded-pill fw-bold shadow" disabled onclick="avancarParaForm()">CONCORDAR E CONTINUAR</button>
+                    </div>
+
+                    <form method="POST" id="step-form" style="display:none;">
+                        <input type="hidden" name="acao" id="acaoInput">
+                        <input type="hidden" name="plano_escolhido" id="planoInput">
+                        <div class="text-center mb-4"><h4 class="fw-bold">Seus Dados</h4></div>
+                        <div class="row g-3">
+                            <div class="col-md-6"><label class="small fw-bold text-muted">NOME DO POLÍTICO</label><input type="text" name="nome" class="form-control form-control-lg bg-light border-0" required></div>
+                            <div class="col-md-6"><label class="small fw-bold text-muted">WHATSAPP OFICIAL</label><input type="text" name="whatsapp" class="form-control form-control-lg bg-light border-0" required></div>
+                            <div class="col-12"><label class="small fw-bold text-muted">E-MAIL (SERÁ SEU LOGIN)</label><input type="email" name="email" class="form-control form-control-lg bg-light border-0" required></div>
+                            <div class="col-md-6"><label class="small fw-bold text-muted">CRIE UMA SENHA</label><input type="password" name="senha" class="form-control form-control-lg bg-light border-0" required></div>
+                            <div class="col-md-6">
+                                <label class="small fw-bold text-muted">NOME DO SITE (SLUG)</label>
+                                <div class="input-group">
+                                    <input type="text" name="slug" class="form-control form-control-lg bg-light border-0" required placeholder="ex: joaosilva">
+                                    <span class="input-group-text border-0 small bg-light text-muted">.<?= str_replace('www.', '', $_SERVER['HTTP_HOST']) ?></span>
+                                </div>
+                            </div>
+                        </div>
+                        <button type="submit" class="btn btn-gradient w-100 py-3 rounded-pill fw-bold mt-5 shadow">FINALIZAR CADASTRO</button>
+                        <div class="text-center mt-3"><a href="#" onclick="voltarParaTermos()" class="text-muted small text-decoration-none">Voltar e ler o contrato novamente</a></div>
+                    </form>
+
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <?php if($msg_cadastro == 'sucesso'): ?>
+<div class="modal fade show" style="display: block; background: rgba(15, 23, 42, 0.95); z-index: 1055;" tabindex="-1">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content border-0 text-center p-4 rounded-4 shadow-lg bg-white text-dark">
+            
+            <?php if($is_pago && isset($pix_data) && !isset($pix_data['erro'])): ?>
+                <h3 class="fw-bold mb-2 text-dark">Falta pouco! 🚀</h3>
+                <p class="text-muted small mb-4">Escaneie o QR Code abaixo para liberar seu sistema.</p>
+                
+                <div class="fs-1 text-success mb-3" style="font-weight: 900;">R$ <?= number_format($preco_plano, 2, ',', '.') ?></div>
+                
+                <div class="bg-light p-3 rounded-4 d-inline-block mb-3 border">
+                    <img src="<?= $pix_data['imagem_base64'] ?>" alt="QR Code" style="width: 200px; height: 200px;">
+                </div>
+                
+                <button onclick="copiarPix()" class="btn btn-outline-secondary w-100 rounded-pill py-3 mb-4 fw-bold">
+                    <i class="fas fa-copy"></i> Copiar Código Pix
+                </button>
+                
+                <div id="status_pagamento" class="bg-light rounded-pill py-2">
+                    <div class="spinner-border spinner-border-sm text-primary" role="status"></div>
+                    <span class="ms-2 fw-bold text-primary small text-uppercase">Aguardando Pagamento...</span>
+                </div>
+
+                <input type="hidden" id="pix_string" value="<?= $pix_data['copia_cola'] ?>">
+
+            <?php elseif(isset($pix_data['erro'])): ?>
+                <h3 class="text-danger fw-bold">Ops! Algo falhou.</h3>
+                <p><?= $pix_data['erro'] ?></p>
+                <a href="index.php" class="btn btn-secondary rounded-pill">Tentar novamente</a>
+
+            <?php else: ?>
+                <div class="mb-4"><div class="spinner-grow text-success" style="width: 4rem; height: 4rem;"></div></div>
+                <h2 class="fw-bold display-5 mb-3 text-success">Sucesso! 🚀</h2>
+                <p class="fs-5 text-muted mb-5">Seu ambiente exclusivo foi criado.</p>
+                <a href="<?= $link_direto ?>" class="btn btn-success btn-lg rounded-pill px-5 py-3 fw-bold shadow-lg">ACESSAR MEU PAINEL</a>
+            <?php endif; ?>
+
+        </div>
+    </div>
+</div>
+<?php endif; ?>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://unpkg.com/aos@2.3.1/dist/aos.js"></script>
+    <script>
+        AOS.init({ once: true });
+
+        // Função para expandir/recolher os benefícios
+        function toggleFeatures(id, btn) {
+            const container = document.getElementById('features-' + id);
+            container.classList.toggle('expanded');
+            container.classList.toggle('collapsed');
+            
+            if (container.classList.contains('expanded')) {
+                btn.innerHTML = 'Ver menos benefícios <i class="fas fa-chevron-up"></i>';
+            } else {
+                btn.innerHTML = 'Ver todos os benefícios <i class="fas fa-chevron-down"></i>';
+            }
+        }
+
+        function abrirModal(tipo, planoSlug) {
+            var modal = new bootstrap.Modal(document.getElementById('modalCadastro'));
+            document.getElementById('acaoInput').value = (tipo === 'teste') ? "criar_teste" : "criar_pagamento";
+            document.getElementById('planoInput').value = planoSlug;
+            document.getElementById('step-contract').style.display = 'block';
+            document.getElementById('step-form').style.display = 'none';
+            document.getElementById('checkTermos').checked = false;
+            liberarBotao();
+            modal.show();
+        }
+        function liberarBotao() { document.getElementById('btnAceitar').disabled = !document.getElementById('checkTermos').checked; }
+        function avancarParaForm() { document.getElementById('step-contract').style.display = 'none'; document.getElementById('step-form').style.display = 'block'; }
+        function voltarParaTermos() { document.getElementById('step-contract').style.display = 'block'; document.getElementById('step-form').style.display = 'none'; }
+    </script>
+</body>
+</html>

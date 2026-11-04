@@ -1,0 +1,28 @@
+PATCH: Deixar assinatura recorrente Mercado Pago
+
+Arquivos:
+- renovar_conta.php: troca o Pix/Vindi por assinatura recorrente Mercado Pago via /preapproval.
+- assinatura_mp_lib.php: cria assinatura, processa webhook e cron.
+- webhook_mp.php: recebe payment, subscription_preapproval e subscription_authorized_payment.
+- cron_sincronizar_assinaturas_mp.php: sincroniza assinaturas salvas em tenants.txid_pagamento.
+- protecao.php: corrige redirect para /renovar_conta.php.
+
+Antes de subir:
+1) Faça backup do site e do banco.
+2) Garanta que existe MP_ACCESS_TOKEN no .env ou config_pagamentos.mp_access_token.
+3) Garanta que tenants tem a coluna txid_pagamento.
+4) Garanta que tenants.email_contato está preenchido.
+
+Webhook no Mercado Pago:
+URL: https://meugabinetedigital.com.br/webhook_mp.php
+Eventos: payment, subscription_preapproval, subscription_authorized_payment
+
+Cron cPanel:
+0 * * * * /usr/local/bin/php -q /home/SEU_USUARIO/public_html/cron_sincronizar_assinaturas_mp.php
+
+Teste:
+1) Login no subdomínio do cliente vencido.
+2) Abrir /renovar_conta.php.
+3) Clicar em ASSINAR RECORRENTE.
+4) Finalizar no Mercado Pago.
+5) Conferir tenants.status=ativo e data_vencimento renovada.

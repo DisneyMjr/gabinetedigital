@@ -1,0 +1,33 @@
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+
+    # 1. MAPEAMENTO DO SITEMAP (Para o Google achar)
+    # Coloquei antes do HTTPS para garantir que o arquivo seja lido
+    RewriteRule ^sitemap\.xml$ sitemap.php [L]
+
+    # 2. FORÇAR HTTPS (Redirecionamento 301)
+    RewriteCond %{HTTPS} off
+    RewriteRule ^(.*)$ https://%{HTTP_HOST}%{REQUEST_URI} [L,R=301]
+
+    # 3. PROTEGER ARQUIVOS SENSÍVEIS
+    <FilesMatch "\.(txt|md|log|sql)$">
+        Order allow,deny
+        Deny from all
+    </FilesMatch>
+    
+    # Libera o robots.txt para o Google ler
+    <Files robots.txt>
+        Order allow,deny
+        Allow from all
+    </Files>
+
+    # Bloqueia acesso direto aos scripts vitais
+    <FilesMatch "^(config|protecao|webhook_mp)\.php$">
+        Order allow,deny
+        Deny from all
+    </FilesMatch>
+
+</IfModule>
+
+# Bloqueia listagem de pastas
+Options -Indexes

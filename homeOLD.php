@@ -1,0 +1,526 @@
+<?php
+// index.php
+require_once 'config.php';
+
+// =========================================================================
+// 1. ROTEADOR E LÓGICA DE SERVIDOR (BACKEND)
+// =========================================================================
+
+if (defined('TENANT_ID')) {
+
+    // Captura a URL digitada
+    $rota = trim(parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH), '/');
+
+    // --- A. ENCURTADOR DE LINKS (/go/xxxx) ---
+    if (strpos($rota, 'go/') === 0) {
+        $codigo = str_replace('go/', '', $rota);
+        try {
+            $stmtLink = $pdo->prepare("SELECT id, url_destino FROM links_curtos WHERE codigo = ? AND tenant_id = ? LIMIT 1");
+            $stmtLink->execute([$codigo, TENANT_ID]);
+            $link = $stmtLink->fetch(PDO::FETCH_ASSOC);
+
+            if ($link) {
+                $pdo->prepare("UPDATE links_curtos SET cliques = cliques + 1 WHERE id = ?")->execute([$link['id']]);
+                header("Location: " . $link['url_destino']);
+                exit;
+            }
+        } catch (Exception $e) { }
+    }
+
+    // --- B. CARREGAR CONFIGURAÇÕES GERAIS ---
+    try {
+        $stmt = $pdo->prepare("SELECT * FROM configuracoes WHERE tenant_id = ?");
+        $stmt->execute([TENANT_ID]);
+        $site_config = $stmt->fetch(PDO::FETCH_ASSOC);
+        if (!$site_config) $site_config = [];
+    } catch (Exception $e) { $site_config = []; }
+
+    // --- C. PREVIEW WHATSAPP (OPEN GRAPH) ---
+    $og_title = !empty($site_config['nome_vereador']) ? $site_config['nome_vereador'] : "Gabinete Digital";
+    $og_desc  = !empty($site_config['hero_texto']) ? mb_strimwidth(strip_tags($site_config['hero_texto']), 0, 150, "...") : "Acesse meu gabinete online.";
+    
+    $protocolo = (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on') ? "https://" : "http://";
+    $base_url = $protocolo . $_SERVER['HTTP_HOST'];
+
+    if (!empty($site_config['foto_hero'])) {
+        $og_image = $base_url . "/" . $site_config['foto_hero'];
+    } elseif (!empty($site_config['logo_site'])) {
+        $og_image = $base_url . "/" . $site_config['logo_site'];
+    } else {
+        $og_image = "https://via.placeholder.com/1200x630?text=Visite+Nosso+Site";
+    }
+
+    // --- D. ROTA DE LANDING PAGES (URL AMIGÁVEL) ---
+    if (!empty($rota) && $rota != 'gabinete' && !file_exists($rota)) {
+        try {
+            $stmt = $pdo->prepare("SELECT html FROM landing_pages WHERE slug = ? AND tenant_id = ?");
+            $stmt->execute([$rota, TENANT_ID]);
+            $pagina = $stmt->fetch(PDO::FETCH_ASSOC);
+            if ($pagina && !empty($pagina['html'])) { echo $pagina['html']; exit; }
+        } catch (Exception $e) {}
+    }
+
+    // --- E. VERIFICAÇÃO DE HOME CUSTOMIZADA (BUILDER) ---
+    if (!isset($_GET['ver']) || $_GET['ver'] != 'site') {
+        try {
+            $stmtLP = $pdo->prepare("SELECT conteudo_html FROM landing_pages WHERE tenant_id = ? AND is_home = 1 LIMIT 1");
+            $stmtLP->execute([TENANT_ID]);
+            $home_customizada = $stmtLP->fetch(PDO::FETCH_ASSOC);
+            if ($home_customizada) { echo $home_customizada['conteudo_html']; exit; }
+        } catch (Exception $e) {}
+    }
+
+    // --- F. MODO GABINETE ONLINE APENAS ---
+    $modo = $site_config['pagina_inicial'] ?? 'padrao';
+    if ($modo == 'gabinete' && (!isset($_GET['ver']) || $_GET['ver'] != 'site')) {
+        require_once 'gabinete_online.php';
+        exit;
+    }
+
+} else {
+    if(file_exists('saas_landing.php')) { require_once 'saas_landing.php'; } else { echo "Gabinete Digital SaaS"; }
+    exit;
+}
+
+$avatar_padrao = 'https://via.placeholder.com/600x600?text=Foto+Aqui';
+$foto_hero = (!empty($site_config['foto_hero']) && file_exists($site_config['foto_hero'])) ? $site_config['foto_hero'] : $avatar_padrao;
+?>
+
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title><?= $site_config['nome_vereador'] ?? 'Site Oficial' ?></title>
+    
+    <?php if(!empty($site_config['logo_site'])): ?>
+    <link rel="icon" href="<?= $site_config['logo_site'] ?>">
+    <?php endif; ?>
+
+    <meta property="og:locale" content="pt_BR">
+    <meta property="og:type" content="website">
+    <meta property="og:title" content="<?= htmlspecialchars($og_title) ?>">
+    <meta property="og:description" content="<?= htmlspecialchars($og_desc) ?>">
+    <meta property="og:url" content="<?= $base_url . $_SERVER['REQUEST_URI'] ?>">
+    <meta property="og:site_name" content="<?= htmlspecialchars($og_title) ?>">
+    <meta property="og:image" content="<?= $og_image ?>">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&family=Montserrat:wght@700;900&display=swap" rel="stylesheet">
+
+    <style>
+        :root {
+            --primary-blue: <?= $site_config['cor_primaria'] ?? '#0d6efd' ?>; 
+            --accent-yellow: <?= $site_config['cor_secundaria'] ?? '#ffc107' ?>;
+            --dark-blue: color-mix(in srgb, var(--primary-blue), black 20%);
+            --text-dark: #1A2B49;
+            --white: #ffffff;
+        }
+        
+        body { font-family: 'Inter', sans-serif; color: var(--text-dark); overflow-x: hidden; }
+        h1, h2, h3, .btn-font { font-family: 'Montserrat', sans-serif; font-weight: 800; }
+        
+        .navbar { background: var(--white); box-shadow: 0 4px 20px rgba(0,0,0,0.05); padding: 15px 0; }
+        .nav-link { font-weight: 600; color: var(--text-dark); margin: 0 10px; text-transform: uppercase; font-size: 0.9rem; }
+        .btn-nav { background: var(--primary-blue); color: white; border-radius: 50px; padding: 8px 25px; font-weight: 700; transition: 0.3s; }
+        .btn-nav:hover { background: var(--dark-blue); color: white; transform: translateY(-2px); }
+        
+        .hero-section { background: radial-gradient(circle at 70% 50%, var(--dark-blue) 0%, var(--primary-blue) 100%); min-height: 85vh; position: relative; display: flex; align-items: center; overflow: hidden; padding-top: 80px; }
+        .hero-bg-pattern { position: absolute; top: 0; left: 0; width: 100%; height: 100%; background-image: radial-gradient(rgba(255,255,255,0.1) 2px, transparent 2px); background-size: 30px 30px; pointer-events: none; }
+        .hero-title { font-size: 4rem; line-height: 1; color: white; text-transform: uppercase; margin-bottom: 10px; }
+        .hero-subtitle { font-size: 1.5rem; color: var(--accent-yellow); font-weight: 700; margin-bottom: 30px; }
+        .hero-img { position: relative; z-index: 2; max-height: 650px; object-fit: contain; mask-image: linear-gradient(to bottom, black 85%, transparent 100%); }
+        
+        .icon-strip { background: var(--accent-yellow); padding: 20px 0; overflow: hidden; white-space: nowrap; position: relative; z-index: 3; margin-top: -5px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
+        .icon-strip i { font-size: 1.5rem; color: rgba(255,255,255,0.8); margin: 0 40px; display: inline-block; }
+        
+        .section-bio { padding: 100px 0; background: white; }
+        .bio-img-main { border-radius: 20px; box-shadow: 20px 20px 0px var(--primary-blue); width: 100%; }
+        
+        .card-news { border: none; border-radius: 20px; overflow: hidden; background: white; transition: 0.3s; height: 100%; box-shadow: 0 10px 20px rgba(0,0,0,0.05); }
+        .card-news:hover { transform: translateY(-10px); }
+        .card-news img { height: 250px; object-fit: cover; width: 100%; }
+        
+        .card-agenda { transition: 0.3s; border: none; border-radius: 15px; overflow: hidden; }
+        .card-agenda:hover { transform: translateY(-5px); box-shadow: 0 10px 20px rgba(0,0,0,0.1) !important; }
+        
+        .footer-cta { background: var(--primary-blue); color: white; padding: 80px 0 0; }
+        
+        .btn-social-modern {
+            display: flex; align-items: center; justify-content: center; width: 100%; padding: 12px 15px; margin-bottom: 15px;
+            border-radius: 50px; font-weight: 700; font-size: 1rem; text-decoration: none; transition: all 0.3s;
+            border: none; position: relative; overflow: hidden; color: white !important; gap: 10px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); white-space: nowrap;
+        }
+        .btn-social-modern i { font-size: 1.3rem; transition: transform 0.3s; color: white !important; }
+        .btn-social-modern:hover { transform: translateY(-3px); box-shadow: 0 8px 25px rgba(0,0,0,0.2); }
+        
+        .btn-zap-modern { background-color: #25D366; }
+        .btn-insta-modern { background: linear-gradient(45deg, #f09433 0%, #e6683c 25%, #dc2743 50%, #cc2366 75%, #bc1888 100%) !important; }
+
+        @media (max-width: 768px) { .hero-title { font-size: 2.5rem; } .hero-img { margin-top: 40px; max-height: 400px; } }
+    </style>
+</head>
+<body>
+
+    <nav class="navbar navbar-expand-lg fixed-top">
+        <div class="container">
+            <a class="navbar-brand" href="#">
+                <?php if (!empty($site_config['logo_site']) && file_exists($site_config['logo_site'])): ?>
+                    <img src="<?= $site_config['logo_site'] ?>" alt="Logo" style="height: 50px; width: auto;">
+                <?php else: ?>
+                    <span class="text-primary fw-bold text-uppercase fs-4">
+                        <i class="fas fa-landmark"></i> <?= $site_config['nome_vereador'] ?? 'MANDATO' ?>
+                    </span>
+                <?php endif; ?>
+            </a>
+            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
+                <span class="navbar-toggler-icon"></span>
+            </button>
+            <div class="collapse navbar-collapse" id="navbarNav">
+                <ul class="navbar-nav ms-auto align-items-center">
+                    <li class="nav-item"><a class="nav-link" href="#bio">Quem Sou</a></li>
+                    <li class="nav-item"><a class="nav-link" href="#agenda">Agenda</a></li>
+                    <li class="nav-item"><a class="nav-link" href="#projetos">Atuação</a></li>
+                    <li class="nav-item"><a class="nav-link" href="#noticias">Notícias</a></li>
+                    <li class="nav-item"><a class="nav-link" href="transparencia.php">Transparência</a></li>
+                    
+                    <li class="nav-item ms-3">
+                        <a href="gabinete_online.php" class="btn btn-nav shadow-sm"><i class="fas fa-bullhorn me-2"></i> Gabinete Online</a>
+                    </li>
+                    <a href="meus_pedidos.php" class="btn btn-outline-primary rounded-pill fw-bold ms-2"><i class="fas fa-search me-2"></i> Pedidos</a>
+                </ul>
+            </div>
+        </div>
+    </nav>
+
+    <section class="hero-section">
+        <div class="hero-bg-pattern"></div>
+        <div class="container h-100">
+            <div class="row h-100 align-items-center">
+                <div class="col-lg-6 pt-5 pt-lg-0">
+                    <span class="badge bg-warning text-dark mb-3 px-3 py-2 fw-bold rounded-pill text-uppercase">
+                        <?= $site_config['hero_badge'] ?? 'Site Oficial' ?>
+                    </span>
+                    <h1 class="hero-title"><?= $site_config['nome_vereador'] ?? 'Seu Nome' ?></h1>
+                    <p class="hero-subtitle"><?= $site_config['hero_cargo'] ?? 'Vereador' ?></p>
+                    <p class="lead text-white mb-4 opacity-75">
+                        <?= $site_config['hero_texto'] ?? 'Trabalho e compromisso por nossa cidade.' ?>
+                    </p>
+                    <div class="d-flex gap-3 flex-wrap">
+                        <a href="gabinete_online.php" class="btn btn-light rounded-pill px-4 py-3 fw-bold text-primary shadow text-uppercase">
+                            <?= $site_config['hero_btn_acao'] ?? 'Fazer Pedido' ?>
+                        </a>
+                        <a href="#bio" class="btn btn-outline-light rounded-pill px-4 py-3 fw-bold text-uppercase">
+                            <?= $site_config['hero_btn_bio'] ?? 'Minha História' ?>
+                        </a>
+                    </div>
+                </div>
+                <div class="col-lg-6 text-center text-lg-end d-flex align-items-end justify-content-center h-100">
+                    <img src="<?= $foto_hero ?>" class="hero-img img-fluid">
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <div class="icon-strip">
+        <?php for($i=0; $i<15; $i++): ?>
+            <i class="fas fa-heartbeat"></i> <i class="fas fa-book-open"></i> <i class="fas fa-users"></i> <i class="fas fa-city"></i>
+        <?php endfor; ?>
+    </div>
+
+    <section id="bio" class="section-bio">
+        <div class="container">
+            <div class="row align-items-center">
+                <div class="col-lg-5 mb-5 mb-lg-0">
+                    <div class="bio-img-container position-relative">
+                        <img src="<?= $foto_hero ?>" class="bio-img-main img-fluid" alt="Perfil">
+                        <div class="position-absolute bottom-0 end-0 bg-warning p-4 rounded shadow fw-bold text-primary m-3" 
+                             style="min-width: 180px; transform: translate(30px, 30px); z-index: 2;">
+                            <i class="fas fa-handshake fa-2x mb-2 d-block"></i>
+                            <span class="text-uppercase"><?= $site_config['bio_card_texto'] ?? 'Compromisso' ?></span>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-lg-6 offset-lg-1">
+                    <h5 class="text-primary text-uppercase fw-bold mb-3"><?= $site_config['bio_titulo'] ?? 'Sobre Mim' ?></h5>
+                    <h2 class="mb-4 display-6 fw-bold"><?= $site_config['bio_destaque'] ?? 'Uma vida dedicada ao povo.' ?></h2>
+                    <p class="text-muted mb-4 lead" style="white-space: pre-line; font-size: 1.1rem;">
+                        <?= $site_config['biografia'] ?? 'Texto da biografia aqui...' ?>
+                    </p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section id="agenda" class="py-5 bg-light">
+        <div class="container">
+            <div class="d-flex justify-content-between align-items-end mb-4">
+                <div>
+                    <h2 class="fw-bold text-primary display-6">Agenda Oficial</h2>
+                    <p class="text-muted">Acompanhe nossos compromissos</p>
+                </div>
+            </div>
+            <div id="lista-agenda" class="row g-4">
+                <div class="col-12 text-center py-4">
+                    <div class="spinner-border text-primary" role="status"></div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section id="secao-enquete" class="py-5 d-none">
+        <div class="container">
+            <div class="row justify-content-center">
+                <div class="col-md-8 col-lg-6">
+                    <div class="card shadow border-0 rounded-4">
+                        <div class="card-header text-white text-center py-3 rounded-top-4" style="background: var(--primary-blue);">
+                            <h5 class="mb-0 fw-bold"><i class="fas fa-poll"></i> Sua Opinião</h5>
+                        </div>
+                        <div class="card-body p-4" id="conteudo-enquete"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section id="projetos" class="py-5" style="background: var(--primary-blue);">
+        <div class="container">
+            <div class="text-center mb-5">
+                <span class="badge bg-white text-primary px-3 py-2 rounded-pill fw-bold text-uppercase mb-2 shadow-sm">Transparência</span>
+                <h2 class="text-white fw-bold display-5">Atuação Legislativa</h2>
+                <p class="text-white opacity-75 lead">Projetos de Lei, Requerimentos e Indicações.</p>
+            </div>
+            <div id="lista-projetos" class="row g-4">
+                <div class="col-12 text-center py-5 text-white">
+                    <div class="spinner-border" role="status"></div>
+                    <p>Carregando projetos...</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section id="noticias" class="section-news bg-white py-5">
+        <div class="container">
+            <div class="text-center mb-5">
+                <h2 class="text-dark fw-bold display-5"><?= $site_config['news_titulo'] ?? 'Últimas Notícias' ?></h2>
+                <p class="text-muted"><?= $site_config['news_subtitulo'] ?? 'Fique por dentro do mandato' ?></p>
+            </div>
+            
+            <div id="lista-noticias" class="row g-4">
+                <div class="col-12 text-center py-5 text-muted">
+                    <div class="spinner-border text-primary" role="status"></div>
+                    <p>Carregando novidades...</p>
+                </div>
+            </div>
+
+            <div class="text-center mt-5">
+                 <a href="blog.php" class="btn btn-outline-warning text-dark fw-bold rounded-pill px-5 py-3 shadow-sm border-2">
+                    <?= $site_config['news_btn'] ?? 'Ler Mais' ?>
+                 </a>
+            </div>
+        </div>
+    </section>
+
+    <section class="footer-cta">
+        <div class="container mb-5">
+            <div class="row align-items-center">
+                <div class="col-md-5 d-none d-md-block text-center">
+                    <img src="<?= $foto_hero ?>" class="img-fluid" style="max-height: 400px; mask-image: linear-gradient(to bottom, black 80%, transparent 100%);">
+                </div>
+                <div class="col-md-6 offset-md-1 pb-5">
+                    <h2 class="mb-4 text-white fw-bold display-5"><?= $site_config['footer_titulo'] ?? 'Contato' ?></h2>
+                    <p class="mb-5 text-white opacity-75 lead"><?= $site_config['footer_texto'] ?? 'Entre em contato.' ?></p>
+                    
+                    <div class="row g-3">
+                        <div class="col-sm-6">
+                            <a href="https://wa.me/55<?= preg_replace('/[^0-9]/', '', $site_config['whatsapp_oficial'] ?? '') ?>" class="btn-social-modern btn-zap-modern" target="_blank">
+                                <i class="fab fa-whatsapp"></i> 
+                                <span class="text-truncate"><?= $site_config['footer_btn_zap'] ?? 'WhatsApp' ?></span>
+                            </a>
+                        </div>
+                        <div class="col-sm-6">
+                            <?php
+                                $insta_input = $site_config['instagram'] ?? '';
+                                $usuario_insta = str_replace(['https://', 'http://', 'www.', 'instagram.com/', '@'], '', $insta_input);
+                                $usuario_insta = trim($usuario_insta, '/');
+                            ?>
+                            <a href="https://instagram.com/<?= $usuario_insta ?>" class="btn-social-modern btn-insta-modern" target="_blank">
+                                <i class="fab fa-instagram"></i> 
+                                <span class="text-truncate"><?= $site_config['footer_btn_insta'] ?? 'Instagram' ?></span>
+                            </a>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="bg-dark py-4 text-center text-white-50 small">
+            &copy; <?= date('Y') ?> <?= $site_config['nome_vereador'] ?? '' ?>. Todos os direitos reservados.
+            <?php if (!empty($site_config['cnpj_campanha'])): ?>
+                <br><span class="opacity-75">CNPJ de Campanha: <?= $site_config['cnpj_campanha'] ?></span>
+            <?php endif; ?>
+
+            <div class="mt-3">
+                <a href="login.php" class="link-login-footer text-white-50 text-decoration-none small" style="transition: 0.3s;">
+                    <i class="fas fa-lock me-1"></i> Área Restrita
+                </a>
+            </div>
+            
+        </div>
+    </section>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        document.addEventListener("DOMContentLoaded", function() {
+            carregarAgenda();
+            carregarEnquete();
+            carregarNoticias();
+            carregarProjetos();
+        });
+
+        function carregarNoticias() {
+            fetch('api_noticias.php')
+                .then(res => res.json())
+                .then(dados => {
+                    const container = document.getElementById('lista-noticias');
+                    container.innerHTML = '';
+                    if (!dados || dados.length === 0) {
+                        container.innerHTML = '<p class="text-center w-100">Nenhuma notícia no momento.</p>';
+                        return;
+                    }
+                    dados.forEach(news => {
+                        let img = news.imagem ? news.imagem : 'https://via.placeholder.com/400x300';
+                        let tempDiv = document.createElement("div"); tempDiv.innerHTML = news.texto;
+                        let resumo = (tempDiv.textContent || tempDiv.innerText || "").substring(0, 90) + '...';
+
+                        let html = `
+                            <div class="col-lg-4 col-md-6">
+                                <div class="card card-news h-100 shadow-sm border">
+                                    <img src="${img}" class="card-img-top">
+                                    <div class="card-body d-flex flex-column">
+                                        <small class="text-uppercase text-primary fw-bold mb-2">${news.categoria || 'Geral'}</small>
+                                        <h5 class="fw-bold mb-3 text-dark">${news.titulo}</h5>
+                                        <p class="text-muted small flex-grow-1">${resumo}</p>
+                                    </div>
+                                </div>
+                            </div>`;
+                        container.innerHTML += html;
+                    });
+                }).catch(e => { document.getElementById('lista-noticias').innerHTML = '<p class="text-center">Erro ao carregar notícias.</p>'; });
+        }
+
+        function carregarAgenda() {
+            fetch('api_agenda.php')
+                .then(res => res.json())
+                .then(eventos => {
+                    const container = document.getElementById('lista-agenda');
+                    container.innerHTML = '';
+                    
+                    if (!eventos || eventos.length === 0) {
+                        container.innerHTML = '<div class="alert alert-light w-100 text-center text-muted">Nenhum compromisso agendado.</div>';
+                        return;
+                    }
+        
+                    eventos.forEach(evt => {
+                        let partesData = evt.data_evento.split('-');
+                        let dataObj = new Date(partesData[0], partesData[1] - 1, partesData[2]);
+                        let dia = String(dataObj.getDate()).padStart(2, '0');
+                        let mes = dataObj.toLocaleString('pt-BR', { month: 'short' }).toUpperCase().replace('.', ''); 
+                        let hora = evt.hora_evento ? evt.hora_evento.substring(0, 5) : 'A definir';
+        
+                        let html = `
+                            <div class="col-md-6 col-lg-3">
+                                <div class="card h-100 border-0 shadow-sm card-agenda">
+                                    <div class="card-body d-flex align-items-center">
+                                        <div class="bg-primary text-white rounded p-3 text-center me-3" style="min-width: 75px;">
+                                            <h3 class="m-0 fw-bold display-6">${dia}</h3>
+                                            <small class="fw-bold" style="font-size:0.7rem">${mes}</small>
+                                        </div>
+                                        <div>
+                                            <h6 class="fw-bold mb-1 text-dark">${evt.titulo}</h6>
+                                            <small class="text-muted"><i class="far fa-clock"></i> ${hora} | ${evt.local || 'Local a definir'}</small>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>`;
+                        container.innerHTML += html;
+                    });
+                });
+        }
+
+        function carregarEnquete() {
+            fetch('api_enquete.php')
+                .then(res => res.json())
+                .then(resp => {
+                    if (!resp.tem_enquete) return;
+                    document.getElementById('secao-enquete').classList.remove('d-none');
+                    const box = document.getElementById('conteudo-enquete');
+                    let titulo = `<h5 class="fw-bold text-center mb-4 text-dark">${resp.dados.titulo}</h5>`;
+                    
+                    if (resp.ja_votou) {
+                        let htmlOpcoes = '<div class="vstack gap-3">';
+                        resp.opcoes.forEach(opt => {
+                            let pct = resp.total_votos > 0 ? Math.round((opt.votos / resp.total_votos) * 100) : 0;
+                            htmlOpcoes += `<div><div class="d-flex justify-content-between small fw-bold mb-1 text-dark"><span>${opt.texto}</span><span>${pct}%</span></div><div class="progress" style="height: 10px;"><div class="progress-bar bg-primary" style="width: ${pct}%"></div></div></div>`;
+                        });
+                        box.innerHTML = titulo + htmlOpcoes + '</div><div class="alert alert-success mt-4 text-center small"><i class="fas fa-check-circle"></i> Voto computado!</div>';
+                    } else {
+                        let htmlForm = '<div class="vstack gap-2">';
+                        resp.opcoes.forEach(opt => {
+                            htmlForm += `<label class="list-group-item d-flex gap-3 align-items-center border rounded p-3" style="cursor: pointer;"><input class="form-check-input flex-shrink-0" type="radio" name="voto_id" value="${opt.id}"><span class="pt-1 fw-bold text-dark">${opt.texto}</span></label>`;
+                        });
+                        htmlForm += `<button onclick="votar(${resp.dados.id})" class="btn btn-primary w-100 mt-4 fw-bold py-2 rounded-pill shadow">VOTAR</button></div>`;
+                        box.innerHTML = titulo + htmlForm;
+                    }
+                });
+        }
+
+        function votar(idEnquete) {
+            const selecionado = document.querySelector('input[name="voto_id"]:checked');
+            if (!selecionado) { alert("Escolha uma opção!"); return; }
+            const btn = document.querySelector('button[onclick^="votar"]');
+            btn.innerHTML = 'Computando...'; btn.disabled = true;
+
+            fetch('api_enquete.php', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ id_enquete: idEnquete, id_opcao: selecionado.value })
+            })
+            .then(res => res.json())
+            .then(dados => { if(dados.sucesso) carregarEnquete(); });
+        }
+
+        function carregarProjetos() {
+            fetch('api_projetos.php')
+                .then(res => res.json())
+                .then(projetos => {
+                    const container = document.getElementById('lista-projetos');
+                    container.innerHTML = '';
+                    if (!projetos || projetos.length === 0) {
+                        container.innerHTML = '<p class="text-center text-white w-100 opacity-50">Nenhum projeto cadastrado.</p>';
+                        return;
+                    }
+                    projetos.forEach(p => {
+                        let badgeClass = p.status === 'Aprovado' ? 'bg-success' : (p.status === 'Em Tramitação' ? 'bg-warning text-dark' : 'bg-secondary');
+                        let html = `
+                            <div class="col-md-6 col-lg-4">
+                                <div class="card h-100 border-0 shadow rounded-4 p-3">
+                                    <div class="card-body d-flex flex-column p-0">
+                                        <div class="d-flex justify-content-between align-items-center mb-3">
+                                            <span class="badge ${badgeClass} rounded-pill px-3">${p.status}</span>
+                                            <small class="text-muted fw-bold text-uppercase">${p.tipo} ${p.numero}/${p.ano}</small>
+                                        </div>
+                                        <h5 class="fw-bold text-dark mb-3">${p.titulo}</h5>
+                                        <p class="text-muted small flex-grow-1">${p.resumo || ''}</p>
+                                    </div>
+                                </div>
+                            </div>`;
+                        container.innerHTML += html;
+                    });
+                });
+        }
+    </script>
+</body>
+</html>

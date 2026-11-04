@@ -1,0 +1,65 @@
+<Files "webhook_efi.php">
+    SSLVerifyClient none
+    SSLVerifyDepth 0
+    Satisfy Any
+</Files>
+
+Options -Indexes -MultiViews
+DirectoryIndex index.php index.html
+ErrorDocument 404 /404.php
+
+<IfModule mod_headers.c>
+    Header unset Upgrade
+</IfModule>
+
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteBase /
+
+    # Webhooks liberados e sem redirect
+    RewriteRule ^(webhook_efi|webhook_mp)\.php$ - [L]
+
+    # HTTPS
+    RewriteCond %{HTTPS} off
+    RewriteRule ^ https://%{HTTP_HOST}%{REQUEST_URI} [L,R=301]
+
+    # Rotas críticas SEM extensão para arquivos PHP reais
+    RewriteRule ^login/?$ login.php [NC,L]
+    RewriteRule ^renovar_conta/?$ renovar_conta.php [NC,L]
+    RewriteRule ^admin_painel/?$ admin_painel.php [NC,L]
+    RewriteRule ^master_painel/?$ master_painel.php [NC,L]
+    RewriteRule ^logout/?$ logout.php [NC,L]
+
+    # Remove .php da URL visualmente, exceto webhooks
+    RewriteCond %{REQUEST_URI} !^/(webhook_efi|webhook_mp)\.php$ [NC]
+    RewriteCond %{THE_REQUEST} \s/+(.+?)\.php[\s?] [NC]
+    RewriteRule ^ /%1 [R=301,L]
+
+    # Adiciona .php internamente quando existir
+    RewriteCond %{REQUEST_FILENAME} !-d
+    RewriteCond %{REQUEST_FILENAME} !-f
+    RewriteCond %{DOCUMENT_ROOT}/$1.php -f
+    RewriteRule ^(.+?)/?$ $1.php [NC,L]
+
+    RewriteRule ^sitemap\.xml$ sitemap.php [L]
+
+    # Landing/router final
+    RewriteCond %{REQUEST_FILENAME} !-f
+    RewriteCond %{REQUEST_FILENAME} !-d
+    RewriteRule ^(.*)$ index.php [QSA,L]
+</IfModule>
+
+<FilesMatch "(^\.env|\.(txt|md|log|sql|p12|pem)$)">
+    Order allow,deny
+    Deny from all
+</FilesMatch>
+
+<FilesMatch "^(config|protecao|tracker)\.php$">
+    Order allow,deny
+    Deny from all
+</FilesMatch>
+
+<FilesMatch "^(webhook_mp|webhook_efi)\.php$">
+    Order allow,deny
+    Allow from all
+</FilesMatch>

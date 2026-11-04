@@ -1,0 +1,140 @@
+<?php
+// PROTECAO.PHP - V.FINAL (ROBUSTA)
+if (session_status() === PHP_SESSION_NONE) { session_start(); }
+
+// 1. CONTA NÃO ENCONTRADA (Configuração do config.php falhou)
+if (!defined('TENANT_ID')) {
+    // Em vez de "voltar pra home", mostra erro claro
+    http_response_code(403);
+    die("Erro Crítico: Identificação do Cliente (TENANT_ID) não encontrada. Verifique o config.php (modo landing/domínio).");
+}
+
+// 2. VERIFICAÇÃO DE LOGIN
+if (!isset($_SESSION['id']) || !isset($_SESSION['tenant_id'])) {
+    header("Location: login.php");
+    exit;
+}
+
+// 3. SEGURANÇA CROSS-TENANT (Impede acessar dados de outro cliente)
+$permissoes = $_SESSION['permissoes'] ?? [];
+$eh_master  = in_array('master', $permissoes, true);
+
+if ((string)$_SESSION['tenant_id'] !== (string)TENANT_ID && !$eh_master) {
+    session_destroy();
+    http_response_code(403);
+    die("Acesso Negado: Tentativa de cruzamento de dados.");
+}
+
+// ==========================================================
+// 4. VERIFICAÇÃO DE VENCIMENTO E STATUS (COM HORA EXATA)
+// ==========================================================
+$pagina_atual = basename($_SERVER['PHP_SELF'] ?? '');
+
+// Libera páginas essenciais mesmo vencido
+$paginas_liberadas = [
+    'checkout_vindi.php', // A NOSSA NOVA PÁGINA DE RENOVAÇÃO
+    'radar_pix.php',      // O RADAR PRECISA FUNCIONAR
+    'logout.php'
+];
+
+if (!$eh_master && !in_array($pagina_atual, $paginas_liberadas, true)) {
+    global $pdo;
+    
+    $stmtV = $pdo->prepare("SELECT data_vencimento, status FROM tenants WHERE id = ? LIMIT 1");
+    $stmtV->execute([TENANT_ID]);
+    $dados = $stmtV->fetch(PDO::FETCH_ASSOC);
+
+    if ($dados) {
+        $vencimento = $dados['data_vencimento'];
+        $status     = $dados['status'];
+
+        // Se a data de hoje/agora passou da data de vencimento, ou se o status for bloqueado/pendente...
+        if ($status === 'bloqueado' || $status === 'pendente_pagamento' || strtotime($vencimento) < time()) {
+            
+            // Garante que o status no banco também fique como bloqueado
+            $pdo->prepare("UPDATE tenants SET status = 'bloqueado', ativo = 0 WHERE id = ?")->execute([TENANT_ID]);
+            
+            // Expulsa o cliente para a tela de pagamento da Vindi
+            header("Location: checkout_vindi.php");
+            exit;
+        }
+    }
+}
+
+if (!$eh_master && !in_array($pagina_atual, $paginas_liberadas, true)) {
+
+    global $pdo;
+    if (!isset($pdo)) {
+        // Se config.php não carregou $pdo por algum motivo
+        http_response_code(500);
+        die("Erro crítico: PDO não disponível. Verifique a ordem dos requires (config.php antes do protecao.php).");
+    }
+
+    // Busca dados atualizados do banco (não confiar só na sessão)
+    $stmtV = $pdo->prepare("SELECT data_vencimento, status FROM tenants WHERE id = ? LIMIT 1");
+    $stmtV->execute([TENANT_ID]);
+    $dados = $stmtV->fetch(PDO::FETCH_ASSOC);
+
+    if ($dados) {
+        $vencimento = $dados['data_vencimento'] ?? null;
+        $status     = $dados['status'] ?? null;
+
+        $hoje = new DateTime('today');
+
+        // Regra de Bloqueio: sem data, data inválida, data passada, ou status bloqueado
+        $data_invalida = (!$vencimento || $vencimento === '0000-00-00');
+
+        if (!$data_invalida) {
+            try {
+                $dt_venc = new DateTime($vencimento);
+            } catch (Exception $e) {
+                $dt_venc = null;
+                $data_invalida = true;
+            }
+        }
+
+        if ($status === 'bloqueado' || $data_invalida || ($dt_venc && $dt_venc < $hoje)) {
+            header("Location: renovar_conta.php");
+            exit;
+        }
+    }
+}
+
+// ==========================================================
+// 5. FUNÇÃO DE PERMISSÕES (SUA VERSÃO SIMPLIFICADA)
+// ==========================================================
+if (!function_exists('tem_acesso')) {
+    function tem_acesso($modulo) {
+
+        // 1. MASTER tem acesso total
+        if (isset($_SESSION['permissoes']) && in_array('master', $_SESSION['permissoes'], true)) {
+            return true;
+        }
+
+        // 2. Recupera módulos do plano
+        $modulos_do_plano = $_SESSION['modulos_plano'] ?? [];
+
+        if (empty($modulos_do_plano)) {
+            global $pdo;
+            if (isset($pdo)) {
+                $stmt = $pdo->prepare("
+                    SELECT p.modulos
+                    FROM planos p
+                    JOIN tenants t ON t.plano = p.slug
+                    WHERE t.id = ?
+                    LIMIT 1
+                ");
+                $stmt->execute([TENANT_ID]);
+                $json = $stmt->fetchColumn();
+
+                $modulos_do_plano = json_decode($json ?? '[]', true);
+                if (!is_array($modulos_do_plano)) $modulos_do_plano = [];
+
+                $_SESSION['modulos_plano'] = $modulos_do_plano;
+            }
+        }
+
+        // 3. Se módulo existe no plano, libera
+        return (is_array($modulos_do_plano) && in_array($modulo, $modulos_do_plano, true));
+    }
+}
